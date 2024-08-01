@@ -45,6 +45,12 @@ import type {
   IMediaKeySessionStores,
   IProcessedProtectionData,
   IContentDecryptorEvent,
+  IContentDecryptorStateData,
+  IInitializingContentDecryptorState,
+  IWaitingForAttachmentContentDecryptorState,
+  IReadyForContentContentDecryptorState,
+  IDisposedContentDecryptorState,
+  IErrorContentDecryptorState,
 } from "./types";
 import { MediaKeySessionLoadingType, ContentDecryptorState } from "./types";
 import { DecommissionedSessionError } from "./utils/check_key_statuses";
@@ -87,12 +93,6 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
   public systemId: string | undefined;
 
   /**
-   * Set only if the `ContentDecryptor` failed on an error.
-   * The corresponding Error.
-   */
-  public error: Error | null;
-
-  /**
    * State of the ContentDecryptor (@see ContentDecryptorState) and associated
    * data.
    *
@@ -100,7 +100,7 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
    * This private property stores the current state and the potentially linked
    * data.
    */
-  private _stateData: IContentDecryptorStateData;
+  private _stateData: IContentDecryptorStateMetadata;
 
   /**
    * Contains information about all key sessions loaded for this current
@@ -165,13 +165,15 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
     this._canceller = canceller;
     this._initDataQueue = [];
     this._stateData = {
-      state: ContentDecryptorState.Initializing,
+      state: {
+        name: ContentDecryptorState.Initializing,
+        payload: null,
+      },
       isMediaKeysAttached: MediaKeyAttachmentStatus.NotAttached,
       isInitDataQueueLocked: true,
       data: null,
     };
     this._supportedCodecWhenEncrypted = [];
-    this.error = null;
 
     eme.onEncrypted(
       mediaElement,
@@ -187,29 +189,20 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
 
     initMediaKeys(mediaElement, ksOptions, canceller.signal)
       .then((mediaKeysInfo) => {
-        const { options, mediaKeySystemAccess } = mediaKeysInfo;
+        const { mediaKeySystemAccess } = mediaKeysInfo;
         this._supportedCodecWhenEncrypted = mediaKeysInfo.codecSupport;
         /**
          * String identifying the key system, allowing the rest of the code to
          * only advertise the required initialization data for license requests.
-         *
-         * Note that we only set this value if retro-compatibility to older
-         * persistent logic in the RxPlayer is not important, as the
-         * optimizations this property unlocks can break the loading of
-         * MediaKeySessions persisted in older RxPlayer's versions.
          */
-        let systemId: string | undefined;
-        if (
-          isNullOrUndefined(options.persistentLicenseConfig) ||
-          options.persistentLicenseConfig.disableRetroCompatibility === true
-        ) {
-          systemId = getDrmSystemId(mediaKeySystemAccess.keySystem);
-        }
-
+        const systemId = getDrmSystemId(mediaKeySystemAccess.keySystem);
         this.systemId = systemId;
-        if (this._stateData.state === ContentDecryptorState.Initializing) {
+        if (this._stateData.state.name === ContentDecryptorState.Initializing) {
           this._stateData = {
-            state: ContentDecryptorState.WaitingForAttachment,
+            state: {
+              name: ContentDecryptorState.WaitingForAttachment,
+              payload: null,
+            },
             isInitDataQueueLocked: true,
             isMediaKeysAttached: MediaKeyAttachmentStatus.NotAttached,
             data: { mediaKeysInfo, mediaElement },
@@ -229,7 +222,7 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
    * @see ContentDecryptorState
    * @returns {Object}
    */
-  public getState(): ContentDecryptorState {
+  public getState(): IContentDecryptorStateData {
     return this._stateData.state;
   }
 
@@ -243,12 +236,13 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
    * state is reached, for compatibility reasons.
    */
   public attach(): void {
-    if (this._stateData.state !== ContentDecryptorState.WaitingForAttachment) {
+    if (this._stateData.state.name !== ContentDecryptorState.WaitingForAttachment) {
       throw new Error(
         "`attach` should only be called when " + "in the WaitingForAttachment state",
       );
     } else if (
-      this._stateData.isMediaKeysAttached !== MediaKeyAttachmentStatus.NotAttached
+      this._stateData.isMediaKeysAttached !== MediaKeyAttachmentStatus.NotAttached ||
+      this._stateData.data === null
     ) {
       log.warn("DRM: ContentDecryptor's `attach` method called more than once.");
       return;
@@ -259,9 +253,19 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
       mediaKeysInfo;
     const shouldDisableLock = options.disableMediaKeysAttachmentLock === true;
 
+    const canFilterProtectionData =
+      isNullOrUndefined(options.persistentLicenseConfig) ||
+      options.persistentLicenseConfig.disableRetroCompatibility === true;
     if (shouldDisableLock) {
       this._stateData = {
-        state: ContentDecryptorState.ReadyForContent,
+        state: {
+          name: ContentDecryptorState.ReadyForContent,
+          payload: {
+            systemId: this.systemId,
+            canFilterProtectionData,
+            failOnEncryptedAfterClear: options.failOnEncryptedAfterClear === true,
+          },
+        },
         isInitDataQueueLocked: true,
         isMediaKeysAttached: MediaKeyAttachmentStatus.Pending,
         data: { mediaKeysInfo, mediaElement },
@@ -302,16 +306,20 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
           return;
         }
 
-        const prevState = this._stateData.state;
         this._stateData = {
-          state: ContentDecryptorState.ReadyForContent,
+          state: {
+            name: ContentDecryptorState.ReadyForContent,
+            payload: {
+              systemId: this.systemId,
+              canFilterProtectionData,
+              failOnEncryptedAfterClear: options.failOnEncryptedAfterClear === true,
+            },
+          },
           isMediaKeysAttached: MediaKeyAttachmentStatus.Attached,
           isInitDataQueueLocked: false,
           data: { mediaKeysData: mediaKeysInfo },
         };
-        if (prevState !== ContentDecryptorState.ReadyForContent) {
-          this.trigger("stateChange", ContentDecryptorState.ReadyForContent);
-        }
+        this.trigger("stateChange", this._stateData.state);
         if (!this._isStopped()) {
           this._processCurrentInitDataQueue();
         }
@@ -332,7 +340,10 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
   public dispose() {
     this.removeEventListener();
     this._stateData = {
-      state: ContentDecryptorState.Disposed,
+      state: {
+        name: ContentDecryptorState.Disposed,
+        payload: null,
+      },
       isMediaKeysAttached: undefined,
       isInitDataQueueLocked: undefined,
       data: null,
@@ -353,15 +364,15 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
    * @returns {boolean}
    */
   public isCodecSupported(mimeType: string, codec: string): boolean | undefined {
-    if (this._stateData.state === ContentDecryptorState.Initializing) {
+    if (this._stateData.state.name === ContentDecryptorState.Initializing) {
       log.error(
         "DRM: Asking for codec support while the ContentDecryptor is still initializing",
       );
       return undefined;
     }
     if (
-      this._stateData.state === ContentDecryptorState.Error ||
-      this._stateData.state === ContentDecryptorState.Disposed
+      this._stateData.state.name === ContentDecryptorState.Error ||
+      this._stateData.state.name === ContentDecryptorState.Disposed
     ) {
       log.error("DRM: Asking for codec support while the ContentDecryptor is disposed");
     }
@@ -907,19 +918,20 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
     }
     const formattedErr =
       err instanceof Error ? err : new OtherError("NONE", "Unknown decryption error");
-    this.error = formattedErr;
     this._initDataQueue.length = 0;
     this._stateData = {
-      state: ContentDecryptorState.Error,
+      state: {
+        name: ContentDecryptorState.Error,
+        payload: formattedErr,
+      },
       isMediaKeysAttached: undefined,
       isInitDataQueueLocked: undefined,
       data: null,
     };
     this._canceller.cancel();
-    this.trigger("error", formattedErr);
 
     // The previous trigger might have lead to a disposal of the `ContentDecryptor`.
-    if (this._stateData.state === ContentDecryptorState.Error) {
+    if (this._stateData.state.name === ContentDecryptorState.Error) {
       this.trigger("stateChange", this._stateData.state);
     }
   }
@@ -931,8 +943,8 @@ export default class ContentDecryptor extends EventEmitter<IContentDecryptorEven
    */
   private _isStopped(): boolean {
     return (
-      this._stateData.state === ContentDecryptorState.Disposed ||
-      this._stateData.state === ContentDecryptorState.Error
+      this._stateData.state.name === ContentDecryptorState.Disposed ||
+      this._stateData.state.name === ContentDecryptorState.Error
     );
   }
 
@@ -1213,7 +1225,7 @@ function addKeyIdsFromPeriod(set: Set<Uint8Array>, period: IPeriodMetadata) {
 }
 
 /** Possible states the ContentDecryptor is in and associated data for each one. */
-type IContentDecryptorStateData =
+type IContentDecryptorStateMetadata =
   | IInitializingStateData
   | IWaitingForAttachmentStateData
   | IReadyForContentStateDataUnattached
@@ -1221,15 +1233,15 @@ type IContentDecryptorStateData =
   | IDisposeStateData
   | IErrorStateData;
 
-/** Skeleton that all variants of `IContentDecryptorStateData` use. */
+/** Skeleton that all variants of `IContentDecryptorStateMetadata` use. */
 interface IContentDecryptorStateBase<
-  TStateName extends ContentDecryptorState,
+  TStateData extends IContentDecryptorStateData,
   TIsQueueLocked extends boolean | undefined,
   TIsMediaKeyAttached extends MediaKeyAttachmentStatus | undefined,
   TData,
 > {
   /** Identify the ContentDecryptor's state. */
-  state: TStateName;
+  state: TStateData;
   /**
    * If `true`, the `ContentDecryptor` will wait before processing
    * newly-received initialization data.
@@ -1257,7 +1269,7 @@ const enum MediaKeyAttachmentStatus {
 
 /** ContentDecryptor's internal data when in the `Initializing` state. */
 type IInitializingStateData = IContentDecryptorStateBase<
-  ContentDecryptorState.Initializing,
+  IInitializingContentDecryptorState,
   true, // isInitDataQueueLocked
   MediaKeyAttachmentStatus.NotAttached, // isMediaKeysAttached
   null // data
@@ -1265,7 +1277,7 @@ type IInitializingStateData = IContentDecryptorStateBase<
 
 /** ContentDecryptor's internal data when in the `WaitingForAttachment` state. */
 type IWaitingForAttachmentStateData = IContentDecryptorStateBase<
-  ContentDecryptorState.WaitingForAttachment,
+  IWaitingForAttachmentContentDecryptorState,
   true, // isInitDataQueueLocked
   MediaKeyAttachmentStatus.NotAttached, // isMediaKeysAttached
   // data
@@ -1277,7 +1289,7 @@ type IWaitingForAttachmentStateData = IContentDecryptorStateBase<
  * it has attached the `MediaKeys` to the media element.
  */
 type IReadyForContentStateDataUnattached = IContentDecryptorStateBase<
-  ContentDecryptorState.ReadyForContent,
+  IReadyForContentContentDecryptorState,
   true, // isInitDataQueueLocked
   MediaKeyAttachmentStatus.NotAttached | MediaKeyAttachmentStatus.Pending, // isMediaKeysAttached
   { mediaKeysInfo: IMediaKeysInfos; mediaElement: IMediaElement } // data
@@ -1288,7 +1300,7 @@ type IReadyForContentStateDataUnattached = IContentDecryptorStateBase<
  * it has attached the `MediaKeys` to the media element.
  */
 type IReadyForContentStateDataAttached = IContentDecryptorStateBase<
-  ContentDecryptorState.ReadyForContent,
+  IReadyForContentContentDecryptorState,
   boolean, // isInitDataQueueLocked
   MediaKeyAttachmentStatus.Attached, // isMediaKeysAttached
   {
@@ -1305,7 +1317,7 @@ type IReadyForContentStateDataAttached = IContentDecryptorStateBase<
 
 /** ContentDecryptor's internal data when in the `Disposed` state. */
 type IDisposeStateData = IContentDecryptorStateBase<
-  ContentDecryptorState.Disposed,
+  IDisposedContentDecryptorState,
   undefined, // isInitDataQueueLocked
   undefined, // isMediaKeysAttached
   null // data
@@ -1313,7 +1325,7 @@ type IDisposeStateData = IContentDecryptorStateBase<
 
 /** ContentDecryptor's internal data when in the `Error` state. */
 type IErrorStateData = IContentDecryptorStateBase<
-  ContentDecryptorState.Error,
+  IErrorContentDecryptorState,
   undefined, // isInitDataQueueLocked
   undefined, // isMediaKeysAttached
   null // data
