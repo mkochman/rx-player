@@ -40,7 +40,7 @@ import type {
   IKeySystemOption,
   IPlayerError,
 } from "../../public_types";
-import type { ITransportOptions } from "../../transports";
+import type { IThumbnailResponse, ITransportOptions } from "../../transports";
 import arrayFind from "../../utils/array_find";
 import assert, { assertUnreachable } from "../../utils/assert";
 import idGenerator from "../../utils/id_generator";
@@ -99,12 +99,24 @@ export default class MultiThreadContentInitializer extends ContentInitializer {
   private _currentMediaSourceCanceller: TaskCanceller;
 
   /**
-   * Stores the resolvers and the current messageId that is sent to the web worker to receive segment sink metrics.
+   * Stores the resolvers and the current requestId that is sent to the web worker to receive segment sink metrics.
    * The purpose of collecting metrics is for monitoring and debugging.
    */
-  private _segmentMetrics: {
-    lastMessageId: number;
-    resolvers: Record<number, (value: ISegmentSinkMetrics | undefined) => void>;
+  private _awaitingRequests: {
+    nextRequestId: number;
+    pendingSinkMetrics: Map<
+      number /* request id */,
+      {
+        resolve: (value: ISegmentSinkMetrics | undefined) => void;
+      }
+    >;
+    pendingThumbnailFetching: Map<
+      number /* request id */,
+      {
+        resolve: (value: IThumbnailResponse) => void;
+        reject: (error: Error) => void;
+      }
+    >;
   };
 
   /**
@@ -119,9 +131,10 @@ export default class MultiThreadContentInitializer extends ContentInitializer {
     this._currentMediaSourceCanceller = new TaskCanceller();
     this._currentMediaSourceCanceller.linkToSignal(this._initCanceller.signal);
     this._currentContentInfo = null;
-    this._segmentMetrics = {
-      lastMessageId: 0,
-      resolvers: {},
+    this._awaitingRequests = {
+      nextRequestId: 0,
+      pendingSinkMetrics: new Map(),
+      pendingThumbnailFetching: new Map(),
     };
   }
 
@@ -1089,15 +1102,37 @@ export default class MultiThreadContentInitializer extends ContentInitializer {
           if (this._currentContentInfo?.contentId !== msgData.contentId) {
             return;
           }
-          const resolveFn = this._segmentMetrics.resolvers[msgData.value.messageId];
-          if (resolveFn !== undefined) {
-            resolveFn(msgData.value.segmentSinkMetrics);
-            delete this._segmentMetrics.resolvers[msgData.value.messageId];
+          const sinkObj = this._awaitingRequests.pendingSinkMetrics.get(
+            msgData.value.requestId,
+          );
+          if (sinkObj !== undefined) {
+            sinkObj.resolve(msgData.value.segmentSinkMetrics);
+            this._awaitingRequests.pendingSinkMetrics.delete(msgData.value.requestId);
           } else {
             log.error("MTCI: Failed to send segment sink store update");
           }
           break;
         }
+        case WorkerMessageType.ThumbnailDataResponse:
+          if (this._currentContentInfo?.contentId !== msgData.contentId) {
+            return;
+          }
+          const tObj = this._awaitingRequests.pendingThumbnailFetching.get(
+            msgData.value.requestId,
+          );
+          if (tObj !== undefined) {
+            if (msgData.value.status === "error") {
+              tObj.reject(formatWorkerError(msgData.value.error));
+            } else {
+              tObj.resolve(msgData.value.data);
+            }
+            this._awaitingRequests.pendingThumbnailFetching.delete(
+              msgData.value.requestId,
+            );
+          } else {
+            log.error("MTCI: Failed to send segment sink store update");
+          }
+          break;
         default:
           assertUnreachable(msgData);
       }
@@ -1528,22 +1563,42 @@ export default class MultiThreadContentInitializer extends ContentInitializer {
       { clearSignal: cancelSignal, emitCurrentValue: true },
     );
 
-    const _getSegmentSinkMetrics: () => Promise<
-      ISegmentSinkMetrics | undefined
-    > = async () => {
-      this._segmentMetrics.lastMessageId++;
-      const messageId = this._segmentMetrics.lastMessageId;
+    const _getSegmentSinkMetrics = async (): Promise<ISegmentSinkMetrics | undefined> => {
+      this._awaitingRequests.nextRequestId++;
+      const requestId = this._awaitingRequests.nextRequestId;
       sendMessage(this._settings.worker, {
         type: MainThreadMessageType.PullSegmentSinkStoreInfos,
-        value: { messageId },
+        value: { requestId },
       });
       return new Promise((resolve, reject) => {
-        this._segmentMetrics.resolvers[messageId] = resolve;
+        this._awaitingRequests.pendingSinkMetrics.set(requestId, { resolve });
         const rejectFn = (err: CancellationError) => {
-          delete this._segmentMetrics.resolvers[messageId];
+          this._awaitingRequests.pendingSinkMetrics.delete(requestId);
           return reject(err);
         };
         cancelSignal.register(rejectFn);
+      });
+    };
+    const _getThumbnailsData = (
+      periodId: string,
+      thumbnailTrackId: string,
+      time: number,
+    ): Promise<IThumbnailResponse> => {
+      if (this._currentContentInfo === null) {
+        return Promise.reject(new Error("Cannot fetch thumbnails: No content loaded."));
+      }
+      this._awaitingRequests.nextRequestId++;
+      const requestId = this._awaitingRequests.nextRequestId;
+      sendMessage(this._settings.worker, {
+        type: MainThreadMessageType.ThumbnailDataRequest,
+        contentId: this._currentContentInfo.contentId,
+        value: { requestId, periodId, thumbnailTrackId, time },
+      });
+      return new Promise((resolve, reject) => {
+        this._awaitingRequests.pendingThumbnailFetching.set(requestId, {
+          resolve,
+          reject,
+        });
       });
     };
     /**
@@ -1559,6 +1614,7 @@ export default class MultiThreadContentInitializer extends ContentInitializer {
               stopListening();
               this.trigger("loaded", {
                 getSegmentSinkMetrics: _getSegmentSinkMetrics,
+                getThumbnailData: _getThumbnailsData,
               });
             }
           },
